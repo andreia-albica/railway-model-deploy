@@ -4,12 +4,21 @@ import pickle
 import joblib
 import pandas as pd
 from flask import Flask, jsonify, request
-from peewee import Model, IntegerField, FloatField, TextField, IntegrityError, DatabaseError
+from peewee import (
+    Model, IntegerField, FloatField,
+    TextField, IntegrityError
+)
 from playhouse.shortcuts import model_to_dict
 from playhouse.db_url import connect
 
-# Database Configuration
-DB = connect(os.environ.get('DATABASE_URL', 'sqlite:///predictions.db'))
+
+########################################
+# Begin database stuff
+
+# The connect function checks if there is a DATABASE_URL env var.
+# If it exists, it uses it to connect to a remote postgres db.
+# Otherwise, it connects to a local sqlite db stored in predictions.db.
+DB = connect(os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db')
 
 class Prediction(Model):
     observation_id = IntegerField(unique=True)
@@ -20,10 +29,17 @@ class Prediction(Model):
     class Meta:
         database = DB
 
+
 DB.create_tables([Prediction], safe=True)
 
-# Load Model and Columns Metadata
-with open('columns.json', 'r') as fh:
+# End database stuff
+########################################
+
+########################################
+# Unpickle the previously-trained model
+
+
+with open('columns.json') as fh:
     columns = json.load(fh)
 
 pipeline = joblib.load('pipeline.pickle')
@@ -31,51 +47,67 @@ pipeline = joblib.load('pipeline.pickle')
 with open('dtypes.pickle', 'rb') as fh:
     dtypes = pickle.load(fh)
 
-# Flask App Configuration
+
+# End model un-pickling
+########################################
+
+
+########################################
+# Begin webserver stuff
+
 app = Flask(__name__)
+
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    # Flask provides a deserialization convenience function called
+    # get_json that will work if the mimetype is application/json.
     obs_dict = request.get_json()
-    if not all(k in obs_dict['observation'] for k in columns):
-        return jsonify({'error': 'Missing fields in observation'}), 400
-
     _id = obs_dict['id']
     observation = obs_dict['observation']
+    # Now do what we already learned in the notebooks about how to transform
+    # a single observation into a dataframe that will work with a pipeline.
     obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
-
+    # Now get ourselves an actual prediction of the positive class.
     proba = pipeline.predict_proba(obs)[0, 1]
     response = {'proba': proba}
-
+    p = Prediction(
+        observation_id=_id,
+        proba=proba,
+        observation=request.data
+    )
     try:
-        p = Prediction(
-            observation_id=_id,
-            observation=json.dumps(observation),
-            proba=proba
-        )
         p.save()
     except IntegrityError:
+        error_msg = 'Observation ID: "{}" already exists'.format(_id)
+        response['error'] = error_msg
+        print(error_msg)
         DB.rollback()
-        existing_proba = Prediction.get(Prediction.observation_id == _id).proba
-        return jsonify({'error': 'Observation ID already exists', 'proba': existing_proba}), 409
-
     return jsonify(response)
+
 
 @app.route('/update', methods=['POST'])
 def update():
-    data = request.get_json()
-    if not data or 'id' not in data or 'true_class' not in data:
-        return jsonify({'error': 'Request must contain id and true_class'}), 400
-
+    obs = request.get_json()
     try:
-        observation_id = int(data['id'])  # Ensuring the ID is an integer
-        p = Prediction.get(Prediction.observation_id == observation_id)
-    except ValueError:
-        return jsonify({'error': 'ID must be an integer'}), 400
+        p = Prediction.get(Prediction.observation_id == obs['id'])
+        p.true_class = obs['true_class']
+        p.save()
+        return jsonify(model_to_dict(p))
     except Prediction.DoesNotExist:
-        return jsonify({'error': 'Observation ID does not exist'}), 404
+        error_msg = 'Observation ID: "{}" does not exist'.format(obs['id'])
+        return jsonify({'error': error_msg})
 
-    p.true_class = data['true_class']
-    p.save()
-    return jsonify(model_to_dict(p))
 
+@app.route('/list-db-contents')
+def list_db_contents():
+    return jsonify([
+        model_to_dict(obs) for obs in Prediction.select()
+    ])
+
+
+# End webserver stuff
+########################################
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', debug=True, port=5000)
